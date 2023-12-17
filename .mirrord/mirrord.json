@@ -1,0 +1,19 @@
+{
+    "target": {
+        "namespace": "billing",
+        "path": {
+            "deployment": "billing-api"
+        }
+    },
+    "feature": {
+        "network": {
+            "incoming": "steal",
+            "outgoing": true
+        },
+        "fs": "local",
+        "env": true
+    },
+    "agent": {
+        "startup_timeout": 300
+    }
+}

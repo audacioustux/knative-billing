@@ -1,0 +1,106 @@
+version: "3"
+
+tasks:
+  default: task --list-all
+  # provision
+  prod:up: INFRA=prod bin/up.sh
+  dev:up: bin/up.sh
+  # access
+  argo:password: echo "Bearer $(kubectl get secret -n argo default.service-account-token -o=jsonpath='{.data.token}' | base64 --decode)"
+  argo:port-forward: kubectl port-forward -n argo svc/argo-server 2746
+  argocd:password: echo "$(kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" | base64 -d)"
+  argocd:port-forward: kubectl port-forward svc/argocd-server -n argocd 2756:443
+  grafana:port-forward: ebort -- kubectl port-forward -n monitoring svc/kube-prometheus-stack-grafana 3000:80 2> /dev/null # user:pass=admin:prom-operator
+  prometheus:port-forward: ebort -- kubectl port-forward -n monitoring svc/kube-prometheus-stack-prometheus 9090 2> /dev/null
+  # misc
+  k9s: k9s -A --headless
+  cloc: cloc . --vcs git
+  test-pod:curl: kubectl run curl --image=radial/busyboxplus:curl -i --tty --rm
+  cf-tunnel:
+    vars:
+      NS: cloudflared
+    cmds:
+      - kubectl create ns {{.NS}} --dry-run=client -o yaml | kubectl apply -f -
+      - kubectl apply -k k8s/kustomize/cloudflared -n {{.NS}}
+      - kubectl create secret generic cloudflare-config --from-literal=TUNNEL_TOKEN=$CLOUDFLARE_TUNNEL_TOKEN --dry-run=client -o yaml | kubectl apply -n {{.NS}} -f -
+  update-kubeconfig:
+    dir: terraform
+    cmd: aws eks --region $(terraform output -raw region) update-kubeconfig --name $(terraform output -raw cluster_name)
+
+  # wasmjs
+  wasmjs:publish:
+    cmd: >-
+      pack build ${OCI_REGISTRY_USERNAME:?}/wasmjs-runtime 
+      --publish 
+      -b docker.io/paketocommunity/rust 
+      -B paketobuildpacks/builder-jammy-base 
+      -e BP_CARGO_WORKSPACE_MEMBERS="wasmjs-runtime"
+  wasmjs:engine:build:
+    dir: crates/wasmjs-engine
+    cmds:
+      - cargo build --target wasm32-wasi --release
+      - cp ./target/wasm32-wasi/release/wasmjs-engine.wasm ./
+  wasmjs:examples:hono:build:
+    dir: examples/ec-wasmjs-hono
+    cmds:
+      - npm install
+      - npm run build
+    internal: true
+  wasmjs:test:
+    deps:
+      - wasmjs:engine:build
+      - wasmjs:examples:hono:build
+    dir: examples/ec-wasmjs-hono
+    cmd: cargo run --bin wasmjs-runtime bin/
+
+  # billing
+  billing:publish:
+    cmd: >-
+      pack build ${OCI_REGISTRY_USERNAME:?}/ec-billing-api 
+      --publish 
+      -b docker.io/paketocommunity/rust 
+      -B paketobuildpacks/builder-jammy-base 
+      -e BP_CARGO_WORKSPACE_MEMBERS="billing-api"
+  billing:check:
+    dir: crates/billing-api
+    cmds:
+      - touch .trigger
+      - cargo watch -x check -s 'touch .trigger'
+    internal: true
+  billing:watch:
+    dir: crates/billing-api
+    cmd: >-
+      mirrord exec -f .mirrord/mirrord.json -- cargo watch 
+      --no-vcs-ignores -w .trigger 
+      -x 'run --bin billing-api -- --dev'
+    internal: true
+  billing:port-forward:
+    cmd: kubectl port-forward svc/billing-api -n billing 8081:http
+  billing:dev:
+    deps:
+      - billing:check
+      - billing:watch
+  billing:generate:entity:
+    dir: crates/billing-api
+    cmd: >-
+      mirrord exec -f .mirrord/mirrord.json -- sea-orm-cli generate entity 
+      --expanded-format 
+      --serde-skip-deserializing-primary-key 
+      --with-serde both 
+      --lib
+      -o ../billing-api-entity/src
+  billing:psql: kubectl cnpg psql billing-db -n billing app
+  billing:test:gh-push:
+    cmd: http POST localhost:8080/hooks/github X-GitHub-Event:push < misc/gh-push-body.json
+  billing:test:project:
+    cmds:
+      - >-
+        echo '{"name": "arakoodev", "display_name": "Arakoo Dev"}' | http http://localhost:8080/orgs
+      - >-
+        echo '{"add_token_credit": 99999}' | http http://localhost:8080/orgs/1
+      - >-
+        echo '{"name": "hello-world-go", "display_name": "Hello World Go", "repo_name": "ec-helloworld-go", "repo_owner": "audacioustux", "repo_clone_url": "https://github.com/audacioustux/ec-helloworld-go.git", "org_id": 1}' | http http://localhost:8080/projects
+      - >-
+        echo '{"name": "hello-world-wasmjs", "display_name": "Hello World WasmJS", "repo_name": "ec-wasmjs-hono", "repo_owner": "audacioustux", "repo_clone_url": "https://github.com/audacioustux/ec-wasmjs-hono.git", "org_id": 1}' | http http://localhost:8080/projects
+  billing:simulate:traffic:
+    cmd: echo "GET https://hello-world-go-1.default.127.0.0.1.sslip.io" | vegeta attack -insecure -rate=500/s | vegeta report --every 1s | rg -vU 'Get .*'
